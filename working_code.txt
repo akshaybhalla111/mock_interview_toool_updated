@@ -1,0 +1,257 @@
+#config.py
+----------------------------------------
+import os
+
+# OpenRouter or OpenAI key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+# Model selection
+GPT_MODEL = "openai/gpt-3.5-turbo"
+
+# Base URL for OpenRouter (skip if using official OpenAI)
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+# Mode: "desktop" or "mobile"
+MODE = os.getenv("MODE", "desktop")
+
+---------------------------------------------
+#chatgpt_client.py
+----------------------------------------
+import openai
+from config import OPENAI_API_KEY, GPT_MODEL, OPENAI_API_BASE
+
+# Configure client for OpenRouter or OpenAI
+openai.api_key = OPENAI_API_KEY
+if OPENAI_API_BASE:
+    openai.api_base = OPENAI_API_BASE
+    openai.api_type = "open_ai"
+
+# System prompts
+SYSTEM_PROMPT = (
+    "Act as an interviewee in a technical interview. "
+    "Be concise when possible, but if the question asks for lists or deep explanations, give complete and helpful answers, even if long."
+)
+CORRECT_PROMPT = "You are a transcription assistant. Correct the following spoken interview question for clarity, fixing any mistakes, and output only the corrected question."
+
+def get_chatgpt_response(prompt):
+    response = openai.ChatCompletion.create(
+        model=GPT_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message.content.strip()
+
+def correct_transcription(text):
+    response = openai.ChatCompletion.create(
+        model=GPT_MODEL,
+        messages=[
+            {"role": "system", "content": CORRECT_PROMPT},
+            {"role": "user", "content": text}
+        ]
+    )
+    return response.choices[0].message.content.strip()
+	
+
+---------------------------------------------
+#speech_listener.py
+----------------------------------------
+import wave
+import pyaudio
+import numpy as np
+from tempfile import NamedTemporaryFile
+from faster_whisper import WhisperModel
+
+# Whisper model
+whisper_model = WhisperModel("base", compute_type="int8")
+
+RATE = 16000
+CHANNELS = 1
+CHUNK = 1024
+SILENCE_THRESHOLD = 500  # adjust based on mic sensitivity
+# Increase silent duration threshold to 1 second for better question separation
+MAX_SILENT_CHUNKS = int(RATE / CHUNK * 5.0)  # 1 sec of silence
+
+def record_until_silence():
+    pa = pyaudio.PyAudio()
+    stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS,
+                     rate=RATE, input=True,
+                     frames_per_buffer=CHUNK)
+    print("🎙️ Listening for question...")
+
+    frames = []
+    silent_chunks = 0
+    recording = False
+
+    while True:
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        frames.append(data)
+        amplitude = np.frombuffer(data, np.int16)
+        if np.abs(amplitude).mean() > SILENCE_THRESHOLD:
+            recording = True
+            silent_chunks = 0
+        elif recording:
+            silent_chunks += 1
+            if silent_chunks > MAX_SILENT_CHUNKS:
+                break
+
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+
+    with NamedTemporaryFile(delete=False, suffix=".wav") as tf:
+        wf = wave.open(tf.name, 'wb')
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        return tf.name
+
+
+def listen_to_speech():
+    audio_file = record_until_silence()
+    segments, _ = whisper_model.transcribe(audio_file)
+    text = "".join(seg.text for seg in segments)
+    print(f"Heard: {text}")
+    return text.strip()
+	
+---------------------------------------------
+#gui_display.py
+----------------------------------------
+
+import tkinter as tk
+from chatgpt_client import get_chatgpt_response
+
+def show_popup(initial_text):
+    def regenerate():
+        user_q = entry.get().strip()
+        if user_q:
+            response = get_chatgpt_response(user_q)
+            text_box.config(state=tk.NORMAL)
+            text_box.delete("1.0", tk.END)
+            text_box.insert(tk.END, response)
+            text_box.config(state=tk.DISABLED)
+            root.update_idletasks()
+            adjust_window_height(response)
+
+    def adjust_window_height(text):
+        lines = text.count('\n') + text.count('.') // 2 + 3
+        lines = max(10, min(30, lines))
+        text_box.config(height=lines)
+
+    root = tk.Tk()
+    root.title("Mock Interview Assistant")
+
+    # Position top center below webcam
+    screen_width = root.winfo_screenwidth()
+    x = int((screen_width / 2) - 300)
+    y = 100
+    root.geometry(f"+{x}+{y}")
+
+    entry = tk.Entry(root, width=80)
+    entry.pack(pady=(10, 5), padx=10)
+
+    submit_btn = tk.Button(root, text="Regenerate Answer", command=regenerate)
+    submit_btn.pack(pady=(0, 10))
+
+    text_box = tk.Text(root, wrap=tk.WORD, width=80, height=10)
+    text_box.insert(tk.END, initial_text)
+    text_box.config(state=tk.DISABLED)
+    text_box.pack(padx=10, pady=(0, 10))
+
+    close_btn = tk.Button(root, text="Close", command=root.destroy)
+    close_btn.pack(pady=(0, 10))
+
+    adjust_window_height(initial_text)
+    root.mainloop()
+	
+---------------------------------------------
+#web_display.py
+-----------------------------------------------------
+from flask import Flask, request, jsonify, render_template_string
+
+app = Flask(__name__)
+
+latest_response = ""
+
+html_template = """
+<!doctype html>
+<html>
+<head>
+    <title>Mock Interview Assistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; padding: 1em; background-color: #f9f9f9; }
+        .container { max-width: 800px; margin: auto; }
+        .response-box {
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            padding: 1em;
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+            margin-top: 1em;
+        }
+        .copy-btn {
+            float: right;
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 5px;
+        }
+        code {
+            background: #f4f4f4;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>📱 Mock Interview Assistant (Mobile)</h2>
+        <button class="copy-btn" onclick="copyText()">Copy</button>
+        <div class="response-box" id="response">Waiting for question...</div>
+    </div>
+    <script>
+        function copyText() {
+            const text = document.getElementById("response").innerText;
+            navigator.clipboard.writeText(text).then(() => {
+                alert("Copied!");
+            });
+        }
+
+        function updateResponse() {
+            fetch("/latest")
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById("response").innerText = data.response || "Waiting for question...";
+                });
+        }
+
+        setInterval(updateResponse, 3000); // Poll every 3 seconds
+        updateResponse(); // Initial load
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(html_template)
+
+@app.route("/latest")
+def latest():
+    return jsonify({"response": latest_response})
+
+@app.route("/update", methods=["POST"])
+def update():
+    global latest_response
+    latest_response = request.form["response"]
+    return "OK"
+
+def run_web_display():
+    app.run(host="0.0.0.0", port=5000)

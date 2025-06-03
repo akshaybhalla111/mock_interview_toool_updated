@@ -1,0 +1,8 @@
+flask
+openai==0.28.1
+faster-whisper
+pyaudio
+wave
+tkinter
+transformers
+torch
